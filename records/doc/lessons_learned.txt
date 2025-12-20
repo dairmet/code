@@ -1,0 +1,192 @@
+Discogs Local App – Lessons Learned
+Scope
+
+Applies to local, read-only Discogs scripts using personal access tokens (no OAuth, no public app).
+
+1. Collection endpoints are fragile
+
+Endpoints under:
+
+/users/{username}/collection/...
+
+
+are much more sensitive than:
+
+/releases/{id}
+
+/database/search
+
+They can return 403 Forbidden even when the token is valid and works elsewhere.
+
+2. Request “shape” matters more than docs imply
+
+Discogs enforcement is inconsistent. The following factors materially affect success:
+
+User-Agent string
+
+Authorization style
+
+Extra headers
+
+Environment variable resolution
+
+Two scripts with the same token can behave differently.
+
+3. Known-good User-Agent (critical)
+
+A simple, stable UA works best.
+
+Known good:
+
+User-Agent: RecordsPersonalGallery/1.2
+
+
+Avoid:
+
+Generic defaults (python-requests/x)
+
+Overly verbose or changing UAs
+
+4. Use Authorization header ONLY
+
+For collection endpoints, the most reliable pattern observed:
+
+Authorization: Discogs token=YOUR_TOKEN
+
+
+Avoid mixing:
+
+header + ?token=
+
+OAuth remnants
+
+extra auth headers
+
+Simpler is better.
+
+5. Always load .env with override
+
+Windows often has stale environment variables.
+
+Required:
+
+load_dotenv(path_to_env, override=True)
+
+
+Without override=True, the script may silently use:
+
+an old token
+
+a mismatched username
+
+This can cause 403s that look like API issues.
+
+6. Be precise about .env location
+
+For this standard layout:
+
+D:\records\
+  .env
+  personal_gallery\
+    personal_gallery.py
+
+
+Correct resolution is:
+
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+
+Off-by-one directory errors are easy and catastrophic.
+
+7. Prefer folder IDs when available
+
+If you already know folder IDs, skip lookup:
+
+DISCOGS_FOLDERS=Personal:9057173,For Sale:9057166
+
+
+This:
+
+avoids an extra API call
+
+avoids folder-name matching edge cases
+
+8. Preserve Discogs artist sort correctly
+
+To exactly match Discogs UI order:
+
+Fetch collection with:
+
+sort=artist
+sort_order=asc
+
+
+Use collection endpoint artist fields, not /releases/{id} artist data
+
+9. Cache /releases/{id} aggressively
+
+The collection endpoint is incomplete.
+
+Best practice:
+
+Fetch /releases/{id} once
+
+Cache results locally (release_details_cache.json)
+
+Accept blanks if Discogs omits data
+
+10. CSV exports are a downgrade
+
+Discogs CSV exports:
+
+do not preserve true artist sort order
+
+have unreliable country/year
+
+lose clean cover URLs
+
+Use API whenever possible.
+
+11. If it worked recently, don’t assume global changes
+
+Discogs behavior can change:
+
+by endpoint
+
+by request shape
+
+temporarily
+
+If something “worked this morning,” assume:
+
+header / env / auth differences
+
+not token revocation
+
+12. Debug order
+
+When collection access fails:
+
+Verify .env path
+
+Force override=True
+
+Confirm username/token pairing
+
+Simplify headers
+
+Match a known-good User-Agent
+
+Retry same endpoint, not a different data source
+
+Summary (TL;DR)
+
+Discogs collection APIs are picky
+
+Simple requests work best
+
+Environment handling matters
+
+Match known-good patterns exactly
+
+Avoid OAuth unless absolutely required

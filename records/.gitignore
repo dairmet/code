@@ -1,0 +1,27 @@
+# secrets
+.env
+*.token
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# logs
+*.log
+
+# outputs / caches (runtime artifacts)
+cache/
+images/
+offline_gallery/
+*.csv
+*.xlsx
+*.zip
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
