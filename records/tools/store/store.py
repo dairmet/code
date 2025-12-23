@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# BUILD_ID: 20251219_STORE_V04
+# BUILD_ID: 20251222_STORE_V07
 
 from __future__ import annotations
 
@@ -14,8 +14,6 @@ from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 
-APP_DIR = Path(__file__).resolve().parent
-
 # Runtime roots
 RECORDS_HOME = Path(os.getenv("RECORDS_HOME", r"D:\records"))
 ENV_PATH = RECORDS_HOME / ".env"
@@ -25,6 +23,11 @@ RECORDS_OUT = Path(os.getenv("RECORDS_OUT", r"D:\records\outputs"))
 
 OFFLINE_OUT = RECORDS_OUT / "offline_gallery"
 SITE_DIR = RECORDS_OUT / "store" / "site"
+
+# Persistent (hand-edited) pricing overrides
+DATA_DIR = RECORDS_HOME / "data" / "store"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+PRICE_FILE = DATA_DIR / "pricing_overrides.csv"
 
 
 def _safe_int_year(y: str) -> Optional[int]:
@@ -51,7 +54,6 @@ def _norm(s: str) -> str:
 
 
 def _key_artist_title(artist: str, title: str) -> str:
-    # Dedup key: case-insensitive, collapse whitespace
     def norm2(x: str) -> str:
         x = (x or "").strip().lower()
         x = re.sub(r"\s+", " ", x)
@@ -61,21 +63,60 @@ def _key_artist_title(artist: str, title: str) -> str:
 
 def _choose_year(years: List[Optional[int]]) -> Optional[int]:
     ys = [y for y in years if isinstance(y, int)]
-    if not ys:
-        return None
-    # Prefer the earliest known year (usually original issue year)
-    return min(ys)
+    return min(ys) if ys else None
 
 
-def read_records_csv_dedup(path: Path) -> List[dict]:
+def load_pricing_overrides(path: Path) -> Dict[str, dict]:
+    """
+    pricing_overrides.csv lives in D:\records\data\store\pricing_overrides.csv (persistent).
+
+    Supported schemas:
+      A) New schema (preferred): keyed by Discogs release id
+         - variant_release_ids, price, status, condition, sleeve_condition, notes
+      B) Legacy schema: keyed by normalized artist||title
+         - key, price, status, condition, sleeve_condition, notes
+
+    Returns a dict with two maps:
+      - by_rid: { "12345": {price/status/...} }
+      - by_key: { "artist||title": {price/status/...} }
+    """
+    out = {"by_rid": {}, "by_key": {}}
+    if not path.exists():
+        return out
+
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
+        r = csv.DictReader(f)
+        flds = [c.strip() for c in (r.fieldnames or [])]
+
+        has_rid = "variant_release_ids" in flds
+        has_key = "key" in flds
+
+        for row in r:
+            price_blob = {
+                "price": _norm(row.get("price","")),
+                "status": _norm(row.get("status","")),
+                "condition": _norm(row.get("condition","")),
+                "sleeve_condition": _norm(row.get("sleeve_condition","")),
+                "notes": _norm(row.get("notes","")),
+            }
+
+            if has_rid:
+                rid = _norm(row.get("variant_release_ids",""))
+                if rid:
+                    out["by_rid"][rid] = price_blob
+
+            if has_key:
+                key = _norm(row.get("key",""))
+                if key:
+                    out["by_key"][key] = price_blob
+
+    return out
+
+
+def read_records_csv_dedup(path: Path, pricing: Dict[str, dict]) -> List[dict]:
     """
     Reads offline_gallery records.csv and returns *deduped* store items grouped by Artist+Title.
-
-    Output schema (per item):
-      - release_id: representative release id (string)
-      - variant_release_ids: list of release ids in the group
-      - qty: number of copies/variants found in the for-sale folder
-      - artist/title/year/decade/label/catno/genre/style/img/search_blob
+    Applies pricing overrides by key.
     """
     if not path.exists():
         raise FileNotFoundError(f"Missing records.csv at: {path}")
@@ -86,44 +127,43 @@ def read_records_csv_dedup(path: Path) -> List[dict]:
     with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            folder = _norm(row.get("folder", ""))
+            folder = _norm(row.get("folder",""))
             if folder.lower() != "for sale":
                 continue
 
-            rid = _norm(row.get("release_id", ""))
+            rid = _norm(row.get("release_id",""))
             if not rid:
                 continue
 
-            artist = _norm(row.get("artist", ""))
-            title = _norm(row.get("title", ""))
+            artist = _norm(row.get("artist",""))
+            title = _norm(row.get("title",""))
             if not artist and not title:
                 continue
 
             key = _key_artist_title(artist, title)
 
-            # Parse year
-            year_raw = _norm(row.get("year", ""))
+            year_raw = _norm(row.get("year",""))
             y = _safe_int_year(year_raw)
             years_by_key[key].append(y)
 
-            # Grab other fields (first non-empty wins)
-            country = _norm(row.get("country", ""))
-            label = _norm(row.get("label", ""))
-            catno = _norm(row.get("catno", ""))
-            genre = _norm(row.get("genre", "")) or "Unknown"
-            style = _norm(row.get("style", ""))
-            img = _norm(row.get("img", ""))  # typically images/<file>
+            country = _norm(row.get("country",""))
+            label = _norm(row.get("label",""))
+            catno = _norm(row.get("catno",""))
+            genre = _norm(row.get("genre","")) or "Unknown"
+            style = _norm(row.get("style",""))
+            img = _norm(row.get("img",""))  # relative like images/abcd.jpeg
 
             if key not in groups:
                 blob = f"{artist} {title}".strip().lower()
                 groups[key] = {
+                    "key": key,
                     "release_id": rid,                 # representative
                     "variant_release_ids": [rid],      # all rids in this group
                     "qty": 1,
                     "artist": artist,
                     "title": title,
-                    "year": year_raw,                  # replaced later after choosing
-                    "decade": "Unknown",               # replaced later
+                    "year": year_raw,
+                    "decade": "Unknown",
                     "country": country,
                     "label": label,
                     "catno": catno,
@@ -141,35 +181,47 @@ def read_records_csv_dedup(path: Path) -> List[dict]:
                 g = groups[key]
                 g["qty"] = int(g.get("qty", 1)) + 1
                 g["variant_release_ids"].append(rid)
-
-                # prefer an image if we don't have one yet
                 if not g.get("img") and img:
                     g["img"] = img
-
-                # keep first non-empty label/catno/genre/style if missing
                 for fld, val in [("label", label), ("catno", catno), ("genre", genre), ("style", style), ("country", country)]:
                     if (not g.get(fld)) and val:
                         g[fld] = val
 
-    # Finalize year/decade for each group
     items: List[dict] = []
     for key, g in groups.items():
+                # Apply pricing overrides:
+        #   1) By release id (variant_release_ids) if available (preferred)
+        #   2) Fallback to legacy by_key (artist||title)
+        p = None
+        by_rid = pricing.get("by_rid") or {}
+        for rid in (g.get("variant_release_ids") or []):
+            rid2 = _norm(str(rid))
+            if rid2 and rid2 in by_rid:
+                p = by_rid[rid2]
+                break
+
+        if p is None:
+            by_key = pricing.get("by_key") or {}
+            if key in by_key:
+                p = by_key[key]
+
+        if p:
+            for fld in ("price","status","condition","sleeve_condition","notes"):
+                if p.get(fld):
+                    g[fld] = p[fld]
+
         chosen = _choose_year(years_by_key.get(key, []))
         if chosen is not None:
             g["year"] = str(chosen)
             g["decade"] = _decade(chosen)
         else:
-            # If no numeric year found, keep whatever raw year was first (may be blank)
             g["decade"] = "Unknown"
 
-        # Normalize image path: for store site we want it to be relative to store/site/
-        # We'll copy images into site/images, so we rewrite "images/<name>" -> "images/<name>" (same), but ensure no leading slashes.
         if g.get("img"):
             g["img"] = g["img"].lstrip("/\\")
 
         items.append(g)
 
-    # Stable sort
     items.sort(key=lambda x: ((x.get("artist") or "").lower(), (x.get("title") or "").lower()))
     return items
 
@@ -523,18 +575,20 @@ def main() -> int:
     print("=== Store Builder ===", flush=True)
     print(f"Offline gallery: {OFFLINE_OUT}", flush=True)
     print(f"Site output: {SITE_DIR}", flush=True)
+    print(f"Pricing overrides: {PRICE_FILE}", flush=True)
 
     SITE_DIR.mkdir(parents=True, exist_ok=True)
     (SITE_DIR / "images").mkdir(parents=True, exist_ok=True)
 
     records_csv = OFFLINE_OUT / "records.csv"
-    items = read_records_csv_dedup(records_csv)
+    pricing = load_pricing_overrides(PRICE_FILE)
+    items = read_records_csv_dedup(records_csv, pricing)
 
     inv_path = SITE_DIR / "store_inventory.json"
     inv_path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote: {inv_path}", flush=True)
 
-    # Copy images referenced by items to site/images
+    # Copy images referenced by items to site/images and rewrite img to relative paths
     src_images = OFFLINE_OUT / "images"
     dst_images = SITE_DIR / "images"
     copied = 0
@@ -542,20 +596,15 @@ def main() -> int:
         rel = (it.get("img") or "").strip()
         if not rel:
             continue
-        # Expect rel like "images/xxxx.jpeg"
-        name = rel.split("/")[-1]
+        name = rel.split("/")[-1].split("\\")[-1]
         src = src_images / name
         dst = dst_images / name
         if src.exists():
             shutil.copy2(src, dst)
             copied += 1
-            # keep relative path for browser
             it["img"] = f"images/{name}"
-        else:
-            # leave as-is; browser will 404 but page still renders
-            pass
 
-    # Rewrite inventory with finalized img paths
+    # Rewrite inventory after img normalization
     inv_path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Images ready: {dst_images} (copied {copied})", flush=True)
 
