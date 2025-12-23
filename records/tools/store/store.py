@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# BUILD_ID: 20251222_STORE_V07
+# BUILD_ID: 20251222_STORE_V11
 
 from __future__ import annotations
 
@@ -69,47 +69,24 @@ def _choose_year(years: List[Optional[int]]) -> Optional[int]:
 def load_pricing_overrides(path: Path) -> Dict[str, dict]:
     """
     pricing_overrides.csv lives in D:\records\data\store\pricing_overrides.csv (persistent).
-
-    Supported schemas:
-      A) New schema (preferred): keyed by Discogs release id
-         - variant_release_ids, price, status, condition, sleeve_condition, notes
-      B) Legacy schema: keyed by normalized artist||title
-         - key, price, status, condition, sleeve_condition, notes
-
-    Returns a dict with two maps:
-      - by_rid: { "12345": {price/status/...} }
-      - by_key: { "artist||title": {price/status/...} }
+    Keyed by normalized artist||title.
     """
-    out = {"by_rid": {}, "by_key": {}}
     if not path.exists():
-        return out
-
+        return {}
+    out: Dict[str, dict] = {}
     with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
         r = csv.DictReader(f)
-        flds = [c.strip() for c in (r.fieldnames or [])]
-
-        has_rid = "variant_release_ids" in flds
-        has_key = "key" in flds
-
         for row in r:
-            price_blob = {
+            key = _norm(row.get("key",""))
+            if not key:
+                continue
+            out[key] = {
                 "price": _norm(row.get("price","")),
                 "status": _norm(row.get("status","")),
                 "condition": _norm(row.get("condition","")),
                 "sleeve_condition": _norm(row.get("sleeve_condition","")),
                 "notes": _norm(row.get("notes","")),
             }
-
-            if has_rid:
-                rid = _norm(row.get("variant_release_ids",""))
-                if rid:
-                    out["by_rid"][rid] = price_blob
-
-            if has_key:
-                key = _norm(row.get("key",""))
-                if key:
-                    out["by_key"][key] = price_blob
-
     return out
 
 
@@ -189,23 +166,9 @@ def read_records_csv_dedup(path: Path, pricing: Dict[str, dict]) -> List[dict]:
 
     items: List[dict] = []
     for key, g in groups.items():
-                # Apply pricing overrides:
-        #   1) By release id (variant_release_ids) if available (preferred)
-        #   2) Fallback to legacy by_key (artist||title)
-        p = None
-        by_rid = pricing.get("by_rid") or {}
-        for rid in (g.get("variant_release_ids") or []):
-            rid2 = _norm(str(rid))
-            if rid2 and rid2 in by_rid:
-                p = by_rid[rid2]
-                break
-
-        if p is None:
-            by_key = pricing.get("by_key") or {}
-            if key in by_key:
-                p = by_key[key]
-
-        if p:
+        # Apply pricing overrides by key
+        if key in pricing:
+            p = pricing[key]
             for fld in ("price","status","condition","sleeve_condition","notes"):
                 if p.get(fld):
                     g[fld] = p[fld]
@@ -270,12 +233,35 @@ HTML = """<!doctype html>
     textarea { width: 100%; min-height: 220px; border-radius: 12px; border: 1px solid #d6d6d6; padding: 10px; }
     .nowrap { white-space: nowrap; }
     .qtypill{font-size:12px;padding:3px 7px;border-radius:999px;border:1px solid #ddd;background:#fff}
+  
+    .intro { margin: 10px 0 16px; padding: 10px 12px; border: 1px solid #ddd; border-radius: 10px; background: rgba(0,0,0,0.02); }
+    .intro p { margin: 6px 0; }
+    .cartlist { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+    .cartrow { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid #ddd; border-radius: 10px; }
+    .cartrow .meta { flex: 1; }
+    .cartrow .qty { font-variant-numeric: tabular-nums; min-width: 64px; text-align: right; }
+    .cartrow button { padding: 6px 10px; }
+
+  /* V11 modal fixes */
+#modal { z-index: 99999 !important; }
+#modal .modal-card { max-width: min(980px, calc(100vw - 24px)); width: min(980px, calc(100vw - 24px)); overflow-x: hidden; }
+#modal .modal-body { overflow-x: hidden; }
+#cartList { overflow-x: hidden; }
+.cartrow { flex-wrap: wrap; overflow-x: hidden; }
+.cartrow .meta { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+#cartText { overflow-x: hidden; white-space: pre-wrap; }
+
   </style>
 </head>
 <body>
   <div class="header">
     <div class="top">
-      <div class="title">Records For Sale</div>
+      
+    <div class="intro">
+      <p><b>How to use:</b> Browse, filter, and search. Click <b>Add</b> to put records in your cart, then open <b>Cart</b> to review.</p>
+      <p class="muted small">Condition is assumed to be generally good unless noted, but grading can vary—please message me if you want details before buying.</p>
+    </div>
+<div class="title">Records For Sale</div>
       <button id="cartOpen" class="btn cartbtn">Cart (0)</button>
     </div>
     <div class="sub">Search + filter. Status/condition may be uninspected unless noted.</div>
@@ -301,12 +287,13 @@ HTML = """<!doctype html>
         <h2>Your cart</h2>
         <button id="modalClose" class="btn close">Close</button>
       </div>
-      <div class="muted small" style="margin-top:6px;">Copy/paste this into a message to me, or use Email.</div>
+      <div class="muted small" style="margin-top:6px;">Copy/paste this into a message to me.</div>
       <textarea id="cartText" readonly></textarea>
+      <div id="cartList" class="cartlist"></div>
       <div class="row">
+        <button id="clearCartBtn" class="btn">Clear cart</button>
         <button id="copyBtn" class="btn">Copy</button>
-        <button id="emailBtn" class="btn">Email</button>
-        <div id="cartMeta" class="muted small"></div>
+<div id="cartMeta" class="muted small"></div>
       </div>
     </div>
   </div>
@@ -327,6 +314,7 @@ HTML = """<!doctype html>
 
   function cartSummary(){
     const lines = [];
+    const cartItems = [];
     let total = 0, count = 0;
     lines.push("Record order inquiry:");
     lines.push("");
@@ -355,7 +343,45 @@ HTML = """<!doctype html>
     return { text: lines.join("\\n"), total, count };
   }
 
-  function updateCartButton(){
+  
+function renderCartList(cartItems){
+  const el = $("cartList");
+  if(!el) return;
+  if(!cartItems || cartItems.length===0){
+    el.innerHTML = `<div class="muted small">Cart is empty.</div>`;
+    return;
+  }
+  el.innerHTML = cartItems.map(ci=>{
+    const label = `${ci.artist} — ${ci.title} (${ci.year}) [${ci.rid}]`;
+    return `
+      <div class="cartrow">
+        <div class="meta">${escapeHtml(label)}</div>
+        <div class="qty">Qty: <b>${ci.qty}</b></div>
+        <button class="btn" data-action="remove-one" data-rid="${ci.rid}">-1</button>
+        <button class="btn" data-action="add-one" data-rid="${ci.rid}">+1</button>
+        <button class="btn" data-action="remove-all" data-rid="${ci.rid}">Remove</button>
+      </div>`;
+  }).join("");
+
+  el.querySelectorAll("button[data-action]").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      const rid = btn.getAttribute("data-rid");
+      const act = btn.getAttribute("data-action");
+      const cur = Number(state.cart[rid]||0);
+      if(act==="remove-one"){
+        const next = Math.max(0, cur-1);
+        if(next===0) delete state.cart[rid]; else state.cart[rid]=next;
+      }else if(act==="add-one"){
+        state.cart[rid] = cur+1;
+      }else if(act==="remove-all"){
+        delete state.cart[rid];
+      }
+      saveCart(); updateCartButton(); openCart(); // re-render modal
+    });
+  });
+}
+
+function updateCartButton(){
     const {count, total} = cartSummary();
     $("cartOpen").textContent = total>0 ? `Cart (${count}) — $${total.toFixed(0)}` : `Cart (${count})`;
   }
@@ -501,10 +527,12 @@ HTML = """<!doctype html>
   }
 
   function openCart(){
-    const {text, total, count} = cartSummary();
+    const {text, total, count, cartItems} = cartSummary();
     $("cartText").value = text;
     $("cartMeta").textContent = total>0 ? `Items: ${count}  •  Total: $${total.toFixed(0)}` : `Items: ${count}`;
-    $("modal").classList.add("open");
+    
+    renderCartList(cartItems);
+$("modal").classList.add("open");
     $("modal").setAttribute("aria-hidden","false");
   }
   function closeCart(){
@@ -537,16 +565,15 @@ HTML = """<!doctype html>
       try{
         await navigator.clipboard.writeText($("cartText").value);
         $("copyBtn").textContent="Copied!";
-        setTimeout(()=>$("copyBtn").textContent="Copy", 1200);
-      }catch{
+      }catch(e){
         $("copyBtn").textContent="Copy failed";
-        setTimeout(()=>$("copyBtn").textContent="Copy", 1200);
       }
+      setTimeout(()=>$("copyBtn").textContent="Copy", 1200);
     });
 
-    $("emailBtn").addEventListener("click", ()=>{
-      const body = encodeURIComponent($("cartText").value);
-      window.location.href = `mailto:?subject=${encodeURIComponent("Record order inquiry")}&body=${body}`;
+    $("clearCartBtn").addEventListener("click", ()=>{
+      state.cart = {};
+      saveCart(); updateCartButton(); openCart();
     });
 
     fetch("store_inventory.json", {cache:"no-store"})
@@ -561,6 +588,7 @@ HTML = """<!doctype html>
       })
       .catch(err=>{
         $("status").textContent = "Failed to load store_inventory.json: " + err;
+        console.error(err);
       });
   }
   boot();
